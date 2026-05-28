@@ -269,6 +269,23 @@ export interface UserPreferences {
 
 export type ProjectStatus = 'draft' | 'previewed' | 'rendered';
 
+/**
+ * v0.8: a single rendered HTML frame in a multi-frame project.
+ * Maps 1:1 to a node in the project's contentGraph (graphNodeId).
+ */
+export interface FrameRecord {
+  /** Stable id, mirrors the graph node id */
+  graphNodeId: string;
+  /** Absolute path to the rendered HTML file (e.g. .../frames/01-intro.html) */
+  htmlPath: string;
+  /** Playback duration for this frame, seconds */
+  durationSec: number;
+  /** Optional poster image (first-frame thumbnail) */
+  posterPath?: string;
+  /** 0-based index in topo-sorted play order */
+  order: number;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -285,10 +302,20 @@ export interface Project {
   variables: Record<string, unknown>;
   preferences: UserPreferences;
   status: ProjectStatus;
-  /** Path to the latest agent-generated HTML (v0.3 chat-to-HTML pipeline) */
+  /** Path to the latest agent-generated HTML (v0.3 chat-to-HTML pipeline; single-frame fast path) */
   lastPreviewHtmlPath?: string;
   lastPreviewPosterPath?: string;
   lastOutputMp4Path?: string;
+  /**
+   * v0.8: path to content-graph.json for multi-frame projects.
+   * Absent for single-frame fast-path projects.
+   */
+  contentGraphPath?: string;
+  /**
+   * v0.8: rendered frame sequence in topo-sorted play order.
+   * Empty for single-frame fast-path projects.
+   */
+  frames?: FrameRecord[];
   createdAt: string;
   updatedAt: string;
 }

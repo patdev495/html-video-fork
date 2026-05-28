@@ -17,6 +17,7 @@
     "test": "node --test test/"
   },
   "dependencies": {
+    "@html-video/content-graph": "workspace:*",
     "@html-video/core": "workspace:*",
     "@html-video/adapter-hyperframes": "workspace:*",
     "@html-video/project-studio": "workspace:*",

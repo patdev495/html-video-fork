@@ -363,16 +363,48 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         });
         await handle.done;
 
-        // Extract HTML if present; otherwise leave preview alone (chat-only turn)
-        const extracted = extractHtmlDocument(assistantText);
-        if (extracted) {
-          await ctx.orchestrator.writePreviewHtmlRaw(id, extracted);
-          res.write(`data: ${JSON.stringify({ type: 'preview_ready', preview_url: `/preview/${id}` })}\n\n`);
+        // v0.8: try multi-frame path first — content-graph JSON + tagged html blocks.
+        // Fall back to single-frame fast path (v0.7) when no graph is emitted.
+        const multi = extractContentGraphAndFrames(assistantText);
+        let summaryLine = '';
+        if (multi && multi.frames.length > 0) {
+          await ctx.orchestrator.writeContentGraph(id, multi.graph);
+          for (const f of multi.frames) {
+            try {
+              await ctx.orchestrator.writeFrameHtml(id, f.nodeId, f.html);
+            } catch (err) {
+              // Don't abort the whole turn for one bad frame; surface a hint.
+              const msg = err instanceof Error ? err.message : String(err);
+              res.write(
+                `data: ${JSON.stringify({ type: 'text', chunk: `\n[frame ${f.nodeId} skipped: ${msg}]\n` })}\n\n`,
+              );
+            }
+          }
+          res.write(
+            `data: ${JSON.stringify({ type: 'preview_ready', preview_url: `/preview/${id}`, frames: multi.frames.length })}\n\n`,
+          );
+          summaryLine = `✓ ${multi.frames.length}-frame storyboard generated (intent: ${multi.graph.intent})`;
+        } else {
+          // Single-frame fast path: extract one HTML doc, write preview.
+          const extracted = extractHtmlDocument(assistantText);
+          if (extracted) {
+            await ctx.orchestrator.writePreviewHtmlRaw(id, extracted);
+            res.write(
+              `data: ${JSON.stringify({ type: 'preview_ready', preview_url: `/preview/${id}` })}\n\n`,
+            );
+            summaryLine = '✓ updated the HTML preview';
+          }
         }
 
-        // Persist assistant message — strip the html block when present (UI sees summary line)
-        const persistText = extracted
-          ? assistantText.replace(/```html[\s\S]*?```/i, '✓ updated the HTML preview').trim() || '✓ updated the HTML preview'
+        // Persist assistant message — strip the html / graph blocks when present (UI sees summary line)
+        const persistText = summaryLine
+          ? assistantText
+              .replace(/```html[#\w-]*[\s\S]*?```/gi, '')
+              .replace(/```json#content-graph[\s\S]*?```/i, '')
+              .replace(/```json[\s\S]*?```/i, (m) =>
+                /content-graph|"intent"\s*:|"nodes"\s*:/i.test(m) ? '' : m,
+              )
+              .trim() || summaryLine
           : assistantText;
         history.push({
           role: 'assistant',
@@ -387,6 +419,16 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         return;
       }
 
+      // ============== v0.8: content-graph + frames API ==============
+
+      // GET content graph as JSON
+      const cgMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/content-graph$/);
+      if (cgMatch && cgMatch[1] && m === 'GET') {
+        const graph = await ctx.orchestrator.readContentGraph(cgMatch[1]);
+        if (!graph) return json(res, 404, { error: 'No content graph for this project' });
+        return json(res, 200, { graph });
+      }
+
       // ============== File serving ==============
 
       // Project preview HTML (and any sibling files like assets/)
@@ -395,6 +437,19 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         const projId = previewServeMatch[1];
         const sub = previewServeMatch[2] ?? '/preview.html';
         const project = await ctx.orchestrator.load(projId);
+
+        // v0.8: serve a specific frame HTML by graph node id
+        const frameMatch = sub.match(/^\/frame\/([a-z0-9_-]+)$/i);
+        if (frameMatch && frameMatch[1]) {
+          const nodeId = frameMatch[1];
+          const frame = (project.frames ?? []).find((f) => f.graphNodeId === nodeId);
+          if (frame && existsSync(frame.htmlPath)) {
+            return serveFile(frame.htmlPath, res);
+          }
+          res.writeHead(404);
+          return res.end('Frame not found');
+        }
+
         const baseDir = project.lastPreviewHtmlPath
           ? dirname(project.lastPreviewHtmlPath)
           : null;
@@ -718,21 +773,58 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
 
   if (concrete) {
     // Direct-draft path: terse output rules, no branching = claude doesn't stall
-    parts.push(`Output rules:`);
-    parts.push(`- Reply with one complete HTML document inside a fenced html code block.`);
-    parts.push(`- Inline all CSS and JS. CDN imports are fine.`);
-    parts.push(`- Tag every user-visible text node with attribute data-hv-text set to a short stable key (brand_name, tagline, headline, item_1, cta, etc).`);
-    parts.push(`- No prose outside the code block.`);
+    parts.push(`Output rules — pick ONE path:`);
+    parts.push('');
+    parts.push(`A) **Single-frame fast path** — for short brand cards, title cards, single moments, simple promo loops:`);
+    parts.push(`   - Reply with one complete HTML document inside a fenced \`\`\`html code block.`);
+    parts.push(`   - Inline all CSS and JS. CDN imports fine.`);
+    parts.push(`   - Tag every visible text node with data-hv-text set to a stable key (brand_name, tagline, headline, item_1, cta).`);
+    parts.push(`   - No prose outside the code block.`);
+    parts.push('');
+    parts.push(`B) **Multi-frame path** — for explainers, timelines, before/after comparisons, step-by-step walkthroughs, anything ≥ 2 distinct moments:`);
+    parts.push(`   1. First emit a content-graph JSON in a fenced \`\`\`json#content-graph block. Schema:`);
+    parts.push(`      {`);
+    parts.push(`        "schemaVersion": 1,`);
+    parts.push(`        "intent": "single-frame" | "explainer" | "data-viz" | "promo" | "comparison" | "other",`);
+    parts.push(`        "synopsis": "one-line video description",`);
+    parts.push(`        "nodes": [`);
+    parts.push(`          { "id": "intro", "kind": "text", "label": "Intro", "frameIntent": "title-card", "durationSec": 3, "text": "..." },`);
+    parts.push(`          { "id": "stat_users", "kind": "data", "frameIntent": "data-bar", "durationSec": 4, "data": { "label": "MAU", "value": "1.2M" } },`);
+    parts.push(`          { "id": "outro", "kind": "entity", "frameIntent": "outro", "durationSec": 3, "props": { "logo_text": "BrandName" } }`);
+    parts.push(`        ],`);
+    parts.push(`        "edges": [`);
+    parts.push(`          { "from": "intro", "to": "stat_users", "kind": "sequence" },`);
+    parts.push(`          { "from": "stat_users", "to": "outro", "kind": "sequence" }`);
+    parts.push(`        ]`);
+    parts.push(`      }`);
+    parts.push(`      Edge kinds: "sequence" (soft order hint), "dependency" (hard topo constraint), "contrast" (semantic, doesn't affect order).`);
+    parts.push(`   2. Then emit ONE complete HTML document per node, each in a fenced \`\`\`html#<nodeId> code block (e.g. \`\`\`html#intro). Each frame is a self-contained 1920×1080 page that opens with its own animation timeline. Tag visible text with data-hv-text.`);
+    parts.push(`   3. No prose outside the code blocks.`);
+    parts.push('');
+    parts.push(`Choose A or B based on the user's request. When in doubt for a request that mentions multiple things in sequence, pick B.`);
   } else {
     if (isFirstTurn) {
       parts.push(`(This is the first turn. If the message is concrete enough, just draft. Otherwise ask 1–3 questions to surface what's missing — or use the multiple-choice format below.)`);
       parts.push('');
     }
-    parts.push(`# When you decide to draft HTML`);
-    parts.push(`- Reply with one complete HTML document inside a fenced html code block.`);
-    parts.push(`- Inline all CSS and JS. CDN imports are fine.`);
-    parts.push(`- Tag every user-visible text node with data-hv-text set to a short stable key (brand_name, tagline, headline, item_1, cta). Preserve existing keys.`);
-    parts.push(`- No prose outside the code block.`);
+    parts.push(`# When you decide to draft HTML — pick ONE path`);
+    parts.push('');
+    parts.push(`**A) Single-frame fast path** (short brand card / title / single moment):`);
+    parts.push(`- Reply with one complete HTML document inside a fenced \`\`\`html code block.`);
+    parts.push(`- Inline all CSS and JS. CDN imports fine.`);
+    parts.push(`- Tag every visible text node with data-hv-text set to a stable key. Preserve existing keys.`);
+    parts.push('');
+    parts.push(`**B) Multi-frame path** (explainer / timeline / comparison / walkthrough):`);
+    parts.push(`- Emit a \`\`\`json#content-graph block first (nodes + edges; see schema below).`);
+    parts.push(`- Then one \`\`\`html#<nodeId> block per node — each is a complete 1920×1080 HTML page with its own animation timeline.`);
+    parts.push(`- Tag visible text with data-hv-text. No prose between blocks.`);
+    parts.push('');
+    parts.push(`Content-graph schema (B path):`);
+    parts.push(`  schemaVersion: 1`);
+    parts.push(`  intent: "single-frame" | "explainer" | "data-viz" | "promo" | "comparison" | "other"`);
+    parts.push(`  synopsis: string (one-line)`);
+    parts.push(`  nodes: [{ id, kind: "entity"|"data"|"text", label?, frameIntent?, durationSec?, ...kindSpecific }]`);
+    parts.push(`  edges: [{ from, to, kind: "sequence"|"dependency"|"contrast", reason? }]`);
     parts.push('');
     parts.push(`# When you ask questions instead`);
     parts.push(`Reply in plain conversational text. Markdown renders (**bold**, lists, headings).`);
@@ -757,6 +849,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
  * Tries (1) `\`\`\`html ... \`\`\`` block, (2) bare `<!doctype html>...</html>`.
  */
 function extractHtmlDocument(text: string): string | null {
+  // Plain ```html``` block (no node-id tag — single-frame fast path)
   const fence = /```html\s*\n([\s\S]*?)```/i.exec(text);
   if (fence && fence[1]) {
     const html = fence[1].trim();
@@ -765,4 +858,51 @@ function extractHtmlDocument(text: string): string | null {
   const bare = /<!doctype html[\s\S]*?<\/html>/i.exec(text);
   if (bare) return bare[0];
   return null;
+}
+
+/**
+ * v0.8: extract a content-graph JSON block + N tagged html#<nodeId> blocks
+ * from a single agent response.
+ *
+ * Expected agent output format for multi-frame:
+ *   ```json#content-graph
+ *   { "schemaVersion": 1, "intent": "explainer", "nodes": [...], "edges": [...] }
+ *   ```
+ *   ```html#node_1
+ *   <!doctype html>...
+ *   ```
+ *   ```html#node_2
+ *   <!doctype html>...
+ *   ```
+ *
+ * Returns null when no content-graph block is found (caller falls back to
+ * single-frame extraction).
+ */
+function extractContentGraphAndFrames(
+  text: string,
+): { graph: import('@html-video/content-graph').ContentGraph; frames: { nodeId: string; html: string }[] } | null {
+  // Find a fenced JSON block tagged as content-graph.
+  const graphMatch = /```json#content-graph\s*\n([\s\S]*?)```/i.exec(text);
+  if (!graphMatch || !graphMatch[1]) return null;
+  let graph: import('@html-video/content-graph').ContentGraph;
+  try {
+    graph = JSON.parse(graphMatch[1].trim()) as import('@html-video/content-graph').ContentGraph;
+  } catch {
+    return null;
+  }
+  if (!graph || !Array.isArray((graph as { nodes?: unknown[] }).nodes)) return null;
+
+  // Find tagged html blocks: ```html#<nodeId>
+  const frames: { nodeId: string; html: string }[] = [];
+  const re = /```html#([a-z0-9_-]+)\s*\n([\s\S]*?)```/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const nodeId = match[1];
+    const html = match[2]?.trim() ?? '';
+    if (nodeId && /<\/html>/i.test(html)) {
+      frames.push({ nodeId, html });
+    }
+  }
+
+  return { graph, frames };
 }

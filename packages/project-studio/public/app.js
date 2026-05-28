@@ -25,6 +25,9 @@ const state = {
   textFields: [],          // [{key, original, current}]
   textSaveTimer: null,
   pendingAttachments: [],  // [{file, dataUrl?, name, kind, size}] before send
+  // v0.8: multi-frame timeline state
+  activeFrameId: null,     // graphNodeId currently shown in iframe
+  lastGraph: null,         // last fetched ContentGraph (for download)
 };
 
 // ============== boot ==============
@@ -50,6 +53,7 @@ async function refreshProjects() {
 async function selectProject(id) {
   state.selectedId = id;
   state.selected = (await API.getProject(id)).project;
+  state.activeFrameId = null;  // reset frame selection on project switch
   try { state.messages = (await API.getMessages(id)).messages ?? []; }
   catch { state.messages = []; }
   renderSidebar();
@@ -217,6 +221,7 @@ function renderMain() {
         </section>
 
         <section class="right-pane">
+          <div class="frames-strip" id="frames-strip"></div>
           <div class="preview-stage" id="preview-stage">
             <div class="preview-placeholder"><div><div class="ico">🎞️</div>Pick a template above to preview.</div></div>
           </div>
@@ -226,6 +231,17 @@ function renderMain() {
             <button class="reload-btn" id="btn-reload">↻ Reload preview</button>
           </div>
         </section>
+        <div class="graph-modal" id="graph-modal">
+          <div class="panel">
+            <header>
+              <h3>Content graph</h3>
+              <span class="grow"></span>
+              <button class="download-btn" id="graph-download">⬇ Download JSON</button>
+              <button class="close-btn" id="graph-close">✕</button>
+            </header>
+            <pre id="graph-json"></pre>
+          </div>
+        </div>
       `
       : `<div class="empty-state"><div><div class="ico">🎬</div>
           <h2>Pick or create a project</h2>
@@ -491,6 +507,7 @@ function renderPreview() {
   if (!p) {
     stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>
       Pick a project first.</div></div>`;
+    renderFramesStrip();
     return;
   }
   // No template + no prior preview → show "send a chat first" placeholder
@@ -498,17 +515,108 @@ function renderPreview() {
     stage.innerHTML = `<div class="preview-placeholder"><div><div class="ico">🎞️</div>
       Send a chat to generate the first HTML.<br>
       Or pick a template up top for a quick start.</div></div>`;
+    renderFramesStrip();
     return;
   }
+  // v0.8: if multi-frame, default-iframe shows the active frame (first by default).
+  const frames = Array.isArray(p.frames) ? p.frames : [];
+  const sortedFrames = [...frames].sort((a, b) => a.order - b.order);
+  if (sortedFrames.length > 0 && !state.activeFrameId) {
+    state.activeFrameId = sortedFrames[0].graphNodeId;
+  }
+  if (sortedFrames.length > 0 && state.activeFrameId
+      && !sortedFrames.find((f) => f.graphNodeId === state.activeFrameId)) {
+    state.activeFrameId = sortedFrames[0].graphNodeId;
+  }
+  const iframeSrc = sortedFrames.length > 0 && state.activeFrameId
+    ? `/preview/${p.id}/frame/${encodeURIComponent(state.activeFrameId)}?t=${Date.now()}`
+    : `/preview/${p.id}?t=${Date.now()}`;
+  const stamp = sortedFrames.length > 0 && state.activeFrameId
+    ? state.activeFrameId
+    : (p.templateId || '');
   stage.innerHTML = `<div class="preview-frame">
-    <iframe id="preview-iframe" sandbox="allow-scripts" src="/preview/${p.id}?t=${Date.now()}"></iframe>
-    ${p.templateId ? `<div class="stamp">${esc(p.templateId)}</div>` : ''}
+    <iframe id="preview-iframe" sandbox="allow-scripts" src="${iframeSrc}"></iframe>
+    ${stamp ? `<div class="stamp">${esc(stamp)}</div>` : ''}
   </div>`;
+  renderFramesStrip();
 }
 
 function reloadPreview() {
   const iframe = document.getElementById('preview-iframe');
-  if (iframe && state.selected) iframe.src = `/preview/${state.selected.id}?t=${Date.now()}`;
+  if (!iframe || !state.selected) return;
+  const p = state.selected;
+  const frames = Array.isArray(p.frames) ? p.frames : [];
+  if (frames.length > 0 && state.activeFrameId) {
+    iframe.src = `/preview/${p.id}/frame/${encodeURIComponent(state.activeFrameId)}?t=${Date.now()}`;
+  } else {
+    iframe.src = `/preview/${p.id}?t=${Date.now()}`;
+  }
+}
+
+// ============== v0.8: frames timeline + graph modal ==============
+function renderFramesStrip() {
+  const strip = document.getElementById('frames-strip');
+  if (!strip) return;
+  const p = state.selected;
+  const frames = p && Array.isArray(p.frames) ? [...p.frames].sort((a, b) => a.order - b.order) : [];
+  if (frames.length === 0) {
+    strip.classList.remove('has-frames');
+    strip.innerHTML = '';
+    return;
+  }
+  strip.classList.add('has-frames');
+  const tabs = frames.map((f) => {
+    const active = f.graphNodeId === state.activeFrameId ? 'active' : '';
+    return `<button class="frame-tab ${active}" data-fid="${esc(f.graphNodeId)}">
+      <span class="order">${String(f.order + 1).padStart(2, '0')}</span>${esc(f.graphNodeId)}
+    </button>`;
+  }).join('');
+  strip.innerHTML = `<span class="label">Frames</span>${tabs}
+    <button class="frame-graph-btn" id="btn-show-graph">View graph</button>`;
+  strip.querySelectorAll('button.frame-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.activeFrameId = btn.dataset.fid;
+      renderPreview();
+    });
+  });
+  const gbtn = document.getElementById('btn-show-graph');
+  if (gbtn) gbtn.addEventListener('click', openGraphModal);
+}
+
+async function openGraphModal() {
+  if (!state.selected) return;
+  const modal = document.getElementById('graph-modal');
+  const pre = document.getElementById('graph-json');
+  if (!modal || !pre) return;
+  try {
+    const r = await fetch(`/api/projects/${state.selected.id}/content-graph`);
+    if (!r.ok) {
+      pre.textContent = '(no graph for this project)';
+    } else {
+      const { graph } = await r.json();
+      pre.textContent = JSON.stringify(graph, null, 2);
+      state.lastGraph = graph;
+    }
+  } catch (e) {
+    pre.textContent = `error loading graph: ${e.message}`;
+  }
+  modal.classList.add('open');
+  const close = document.getElementById('graph-close');
+  const dl = document.getElementById('graph-download');
+  if (close) close.onclick = () => modal.classList.remove('open');
+  if (dl) dl.onclick = () => {
+    if (!state.lastGraph) return;
+    const blob = new Blob([JSON.stringify(state.lastGraph, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `content-graph-${state.selected.id}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) modal.classList.remove('open');
+  }, { once: true });
 }
 
 // ============== text fields (data-hv-text editor) ==============
@@ -698,18 +806,28 @@ async function sendMessage() {
             state.messages[assistantIdx].content += ev.chunk;
             renderChatLog();
           } else if (ev.type === 'preview_ready') {
+            const frameCount = ev.frames || 0;
+            const summary = frameCount > 0
+              ? `✓ ${frameCount}-frame storyboard generated`
+              : '✓ HTML preview updated';
+            const event = frameCount > 0
+              ? `🎞 storyboard reloaded (${frameCount} frames)`
+              : '🎞 preview reloaded';
             if (assistantIdx === -1) {
-              state.messages[thinkingIdx] = { role: 'assistant', agent: state.selected.agentId ?? 'claude', content: '✓ HTML preview updated', ts: Date.now() };
+              state.messages[thinkingIdx] = { role: 'assistant', agent: state.selected.agentId ?? 'claude', content: summary, ts: Date.now() };
               assistantIdx = thinkingIdx;
             } else {
-              state.messages[assistantIdx].content = '✓ HTML preview updated';
+              state.messages[assistantIdx].content = summary;
             }
-            state.messages.push({ role: 'preview-event', content: '🎞 preview reloaded', ts: Date.now() });
+            state.messages.push({ role: 'preview-event', content: event, ts: Date.now() });
             renderChatLog();
-            reloadPreview();
-            await refreshTextFields();
+            // Multi-frame turn replaces frames[]; reset active frame so the
+            // first frame becomes the default again.
+            if (frameCount > 0) state.activeFrameId = null;
             const pr = await API.getProject(state.selected.id);
             state.selected = pr.project;
+            renderPreview();
+            await refreshTextFields();
             renderToolbar();
             renderFooter();
           } else if (ev.type === 'warning') {

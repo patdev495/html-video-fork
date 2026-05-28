@@ -23,6 +23,7 @@
     "test": "node --test test/"
   },
   "dependencies": {
+    "@html-video/content-graph": "workspace:*",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "yaml": "^2.7.0"

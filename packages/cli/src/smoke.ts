@@ -111,7 +111,48 @@ async function main() {
   if (!existsSync(outputPath)) throw new Error('MP4 output missing');
   ok(`status=${rendered.status} mp4=${outputPath}`);
 
-  // 9. Verify project list works
+  // 9. v0.8: ContentGraph + multi-frame self-test
+  log('v0.8 multi-frame: write content-graph + 3 frames');
+  const project2 = await ctx.orchestrator.create({
+    name: 'Multi-frame explainer demo',
+    intent: 'Test content-graph + frames pipeline',
+    preferences: {},
+  });
+  const graph = {
+    schemaVersion: 1 as const,
+    intent: 'explainer' as const,
+    synopsis: 'Smoke-test explainer with three frames',
+    nodes: [
+      { id: 'intro', kind: 'text' as const, text: 'Hello world', durationSec: 2 },
+      { id: 'middle', kind: 'data' as const, data: { v: 42 }, durationSec: 4 },
+      { id: 'outro', kind: 'entity' as const, props: { logo: 'OD' }, durationSec: 3 },
+    ],
+    edges: [
+      { from: 'intro', to: 'middle', kind: 'sequence' as const },
+      { from: 'middle', to: 'outro', kind: 'dependency' as const },
+    ],
+  };
+  await ctx.orchestrator.writeContentGraph(project2.id, graph);
+  ok('graph persisted + validated');
+
+  for (const node of graph.nodes) {
+    const html = `<!doctype html><html><head><title>${node.id}</title></head><body data-hv-text="${node.id}">${node.id}</body></html>`;
+    const { frame } = await ctx.orchestrator.writeFrameHtml(project2.id, node.id, html);
+    ok(`frame written: ${frame.graphNodeId} order=${frame.order} dur=${frame.durationSec}s path=${frame.htmlPath.split('/').slice(-3).join('/')}`);
+  }
+
+  const finalProject = await ctx.orchestrator.load(project2.id);
+  if (!finalProject.frames || finalProject.frames.length !== 3) {
+    throw new Error(`expected 3 frames, got ${finalProject.frames?.length}`);
+  }
+  // Order should be: intro (no deps), middle (after intro by sequence + before outro), outro (depends on middle)
+  const order = finalProject.frames.map((f) => f.graphNodeId).join(',');
+  if (order !== 'intro,middle,outro') {
+    throw new Error(`unexpected play order: ${order}`);
+  }
+  ok(`play order: ${order}`);
+
+  // 10. Verify project list works
   log('list projects');
   const all = await ctx.orchestrator.list();
   ok(`${all.length} project(s) in store`);
