@@ -670,6 +670,30 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           }
         }
 
+        // Carry source material across turns: a link/file is usually attached
+        // on an early turn (e.g. while picking a content type), but generation
+        // happens several turns later with no attachment on that request. Merge
+        // the project's stored text/data assets (fetched articles/repos,
+        // uploaded docs) into this turn's attachments so they reach the prompt.
+        const seenPaths = new Set(attachments.map((a) => a.path));
+        for (const asset of project.assets) {
+          if ((asset.type === 'text' || asset.type === 'data') && asset.path && !seenPaths.has(asset.path)) {
+            let inlineText: string | undefined;
+            try {
+              const txt = await readFile(asset.path, 'utf8');
+              if (txt.length <= 20_000) inlineText = txt;
+            } catch { /* path-only fallback */ }
+            attachments.push({
+              path: asset.path,
+              kind: asset.type as Attachment['kind'],
+              filename: asset.metadata.filename ?? `${asset.type}-${asset.id.slice(0, 8)}`,
+              size: asset.metadata.sizeBytes ?? 0,
+              ...(inlineText !== undefined && { inlineText }),
+            });
+            seenPaths.add(asset.path);
+          }
+        }
+
         const fullPrompt = buildHtmlGenerationPrompt({
           tmpl,
           exampleHtml,
@@ -679,7 +703,12 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           attachments,
           focusFrameId: focusFrameId || undefined,
         });
-        const phaseInfo = detectPhase(history, userText, !!project.templateId);
+        const phaseInfo = detectPhase(
+          history,
+          userText,
+          !!project.templateId,
+          attachments.some((a) => !!a.inlineText),
+        );
         const t0 = Date.now();
         // Save the prompt next to the project so we can inspect what we sent.
         // Also dump the previous one as .prev for diffing across turns.
@@ -1413,6 +1442,7 @@ function detectPhase(
   history: ChatMessage[],
   userText: string,
   hasTemplate: boolean,
+  hasSourceMaterial = false,
 ): { phase: ConvPhase; inputs: PhaseInputs } {
   const trimmed = userText.trim();
   const inputs: PhaseInputs = {};
@@ -1473,7 +1503,9 @@ function detectPhase(
     // (b) a "skip / I'm done" signal.
     const isSkip = /^(skip|跳过|够了|够|done|next|下一步|ok|好|不知道)$/i.test(trimmed)
       || trimmed.length <= 3;
-    if (isSkip || hasEnoughContent(history, trimmed)) {
+    // With source material attached there's nothing to collect — advance as
+    // soon as the user says anything (the article already is the content).
+    if (isSkip || hasSourceMaterial || hasEnoughContent(history, trimmed)) {
       // Move forward: style if no template, else format.
       inputs.pickedType = lastCardPickByPhase(history, 'type');
       inputs.contentTurns = [...collectContentTurns(history), trimmed];
@@ -1653,7 +1685,11 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
 
   const baseHtml = priorHtml && priorHtml !== exampleHtml ? priorHtml : exampleHtml;
   const trimmed = userText.trim();
-  const { phase, inputs } = detectPhase(history, userText, !!tmpl);
+  // A fetched article / repo / uploaded doc carries inlined content — that IS
+  // the topic, so we should not interrogate the user about what the video is
+  // about. The source rides into every phase's prompt via `attachments`.
+  const hasSourceMaterial = attachments.some((a) => !!a.inlineText);
+  const { phase, inputs } = detectPhase(history, userText, !!tmpl, hasSourceMaterial);
 
   // ---- opener: hv-options card with meta.phase = "type" ----
   if (phase === 'opener') {
@@ -1694,6 +1730,21 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
     const pickedType = inputs.pickedType ?? '';
     const turns = inputs.contentTurns ?? [];
     const p: string[] = [];
+
+    // Source material present → DON'T interrogate. The article/repo content is
+    // the topic; acknowledge it and let the flow advance to style/format.
+    if (hasSourceMaterial) {
+      p.push(`The user is making a ${pickedType ? `"${pickedType}"` : 'video'} based on the source material below — do NOT ask them what it's about, the content is already provided.`);
+      p.push('');
+      for (const a of attachments) p.push(...renderAttachment(a));
+      p.push('');
+      p.push(`In the user's language, write ONE short line that names the actual topic/title you read from the source and states the video will be built from it (e.g. "好，我读完了《…》这篇文章 — 这就基于它生成。下一步选风格。"). Do NOT ask the user to retype or summarize anything. End with this hidden marker on its own line:`);
+      p.push('<!-- hv-phase:content-question -->');
+      p.push('');
+      p.push(`Plain text + the marker only. NO code blocks. NO questions. Do NOT return an empty reply.`);
+      return p.join('\n');
+    }
+
     p.push(`The user is making a ${pickedType ? `"${pickedType}"` : 'video'}. Collect concrete content for it via natural conversation — DO NOT emit any code block, hv-options, hv-form, or hv-confirm. End your reply with this hidden marker on its own line so the server knows you're still in the content phase:`);
     p.push('<!-- hv-phase:content-question -->');
     p.push('');
