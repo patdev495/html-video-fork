@@ -715,14 +715,14 @@
 
   .preview-stage { padding: 22px; overflow: auto; display: flex;
     align-items: center; justify-content: center; min-height: 0; }
+  /* aspect-ratio + max-width are set inline per project resolution (16:9 / 9:16
+     / 1:1 / 4:5); 16/9 here is just a fallback before JS runs. */
   .preview-frame { aspect-ratio: 16/9; background: #000; border-radius: var(--radius);
     overflow: hidden; box-shadow: var(--shadow-md); width: 100%; max-width: 1280px;
     position: relative; }
-  /* iframe stays at the design's native 1920×1080 and is scaled down with a
-     CSS variable so cropped layouts (e.g. position:absolute right: 12px)
-     stay visually intact. The variable is set by JS on resize. */
-  .preview-frame iframe { position: absolute; top: 0; left: 0;
-    width: 1920px; height: 1080px; border: 0;
+  /* iframe renders at the design's native pixel size (set inline) and is scaled
+     down with a CSS variable so cropped layouts stay visually intact. */
+  .preview-frame iframe { position: absolute; top: 0; left: 0; border: 0;
     transform: scale(var(--preview-scale, 1));
     transform-origin: top left; }
   .preview-frame .stamp { position: absolute; bottom: 12px; right: 14px;

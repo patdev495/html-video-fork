@@ -1777,11 +1777,16 @@ function renderPreview() {
   const stamp = sortedFrames.length > 0 && state.activeFrameId
     ? state.activeFrameId
     : (p.templateId || '');
+  // Respect the project's chosen resolution so the preview box matches the real
+  // export aspect (4:5 / 9:16 / 1:1), not a hardcoded 16:9. The iframe renders
+  // at the design's native pixel size and is scaled to fit (scale set on resize).
+  const res = p.preferences?.resolution ?? { width: 1920, height: 1080 };
+  const vw = res.width || 1920, vh = res.height || 1080;
   // sandbox now grants same-origin so we can attach a text-edit overlay
   // from the parent window. allow-scripts keeps the page's own animations
   // running. forms / popups / top-navigation stay blocked.
-  stage.innerHTML = `<div class="preview-frame ${state.editTextMode ? 'editing' : ''}">
-    <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin" src="${iframeSrc}"></iframe>
+  stage.innerHTML = `<div class="preview-frame ${state.editTextMode ? 'editing' : ''}" style="aspect-ratio:${vw}/${vh}">
+    <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin" src="${iframeSrc}" style="width:${vw}px;height:${vh}px"></iframe>
     ${stamp ? `<div class="stamp">${esc(stamp)}</div>` : ''}
     <button class="edit-toggle" id="btn-edit-text"
       title="${state.editTextMode ? t('preview.edit_text_done_title') : t('preview.edit_text_title')}">
@@ -1972,7 +1977,11 @@ function attachPreviewScaler() {
   const apply = () => {
     const w = frame.clientWidth;
     if (!w) return;
-    frame.style.setProperty('--preview-scale', (w / 1920).toFixed(4));
+    // Scale by the iframe's native design width (not a hardcoded 1920) so
+    // non-16:9 aspects (1080-wide) shrink correctly too.
+    const ifr = frame.querySelector('iframe');
+    const nativeW = ifr ? (parseFloat(ifr.style.width) || 1920) : 1920;
+    frame.style.setProperty('--preview-scale', (w / nativeW).toFixed(4));
   };
   apply();
   if (_previewResizeObserver) _previewResizeObserver.disconnect();

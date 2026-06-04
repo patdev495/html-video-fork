@@ -2615,6 +2615,17 @@ async function runSplitMultiFrameGenerate(
   if (aspect === '9:16') resolution = '1080×1920';
   else if (aspect === '1:1') resolution = '1080×1080';
   else if (aspect === '4:5') resolution = '1080×1350';
+  // Persist the chosen resolution on the project so EXPORT records at the right
+  // aspect (it reads project.preferences.resolution; without this it defaulted
+  // to 1920×1080 and squashed a 4:5 / 9:16 frame into a 16:9 canvas).
+  {
+    const [w, h] = resolution.split('×').map(Number);
+    if (w && h) {
+      const proj = await ctx.projects.load(projectId);
+      proj.preferences = { ...proj.preferences, resolution: { width: w, height: h } };
+      await ctx.projects.save(proj);
+    }
+  }
 
   const styleLabel = pickedStyle && /^从设计模板选|template/i.test(pickedStyle)
     ? (tmpl ? `(use the selected template "${tmpl.name}" — ${tmpl.description})` : '(let the model choose)')
