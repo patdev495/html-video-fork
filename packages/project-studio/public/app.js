@@ -44,6 +44,7 @@ const API = {
   agents: () => fetch('/api/agents').then(r => r.json()),
   setTemplate: (id, tid) => fetch(`/api/projects/${id}/template`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ template_id: tid }) }).then(r => r.json()),
   setAgent: (id, aid, model) => fetch(`/api/projects/${id}/agent`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent_id: aid, ...(model !== undefined && { agent_model: model }) }) }).then(r => r.json()),
+  setContentLanguage: (id, language) => fetch(`/api/projects/${id}/content-language`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ language }) }).then(r => r.json()),
   exportMp4: id => fetch(`/api/projects/${id}/export`, { method: 'POST' }).then(r => r.json()),
   getMessages: id => fetch(`/api/projects/${id}/messages`).then(r => r.json()),
   rawHtml: id => fetch(`/api/projects/${id}/raw-html`).then(r => r.ok ? r.text() : null),
@@ -532,9 +533,40 @@ function renderToolbar() {
     exportBtn.textContent = t('toolbar.export_mp4');
   }
   renderAgentPill();
+  renderContentLanguage();
 
   // Re-wire on every render so handlers always match the current DOM.
   wireToolbar();
+}
+
+const CONTENT_LANGUAGE_LABELS = {
+  vi: 'Tiếng Việt',
+  en: 'English',
+  'zh-CN': '简体中文',
+  'zh-TW': '繁體中文',
+};
+
+function renderContentLanguage() {
+  const p = state.selected;
+  const select = document.getElementById('content-language-select');
+  const status = document.getElementById('content-language-status');
+  const translate = document.getElementById('btn-translate-video');
+  if (!select || !status || !translate) return;
+
+  const busy = !!state.composing || !!state.exporting || !!state.enhancing;
+  select.disabled = !p || busy;
+  select.value = p?.preferences?.language ?? 'auto';
+  const current = p?.preferences?.contentLanguage;
+  const target = p?.preferences?.targetLanguage;
+  status.textContent = current
+    ? t('content_language.current', { language: CONTENT_LANGUAGE_LABELS[current] ?? current })
+    : (target ? t('content_language.target', { language: CONTENT_LANGUAGE_LABELS[target] ?? target }) : '');
+  const mismatch = !!p && !!current && !!target && current !== target;
+  translate.hidden = !mismatch;
+  translate.disabled = busy;
+  translate.textContent = mismatch
+    ? t('content_language.translate', { language: CONTENT_LANGUAGE_LABELS[target] ?? target })
+    : '';
 }
 
 /** Fill the top-bar Agent pill: current agent's logo + name + connection dot. */
@@ -725,6 +757,25 @@ function wireToolbar() {
       if (!state.selected) return;
       if (state.exporting) return;
       startExportStream();
+    };
+  }
+  const languageSelect = document.getElementById('content-language-select');
+  if (languageSelect) {
+    languageSelect.onchange = async () => {
+      if (!state.selected) return;
+      languageSelect.disabled = true;
+      try {
+        const result = await API.setContentLanguage(state.selected.id, languageSelect.value);
+        if (!result.project) throw new Error(result.error || 'Could not update language');
+        state.selected = result.project;
+        const target = state.selected.preferences?.targetLanguage;
+        toast(t('content_language.target_set', {
+          language: CONTENT_LANGUAGE_LABELS[target] ?? target ?? languageSelect.value,
+        }), 'success');
+      } catch (e) {
+        toast(`${e?.message ?? e}`, 'error');
+      }
+      renderToolbar();
     };
   }
   const nameInput = document.getElementById('proj-name');

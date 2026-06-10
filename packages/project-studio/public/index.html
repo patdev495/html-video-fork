@@ -108,6 +108,13 @@
     font-size: 12.5px; cursor: pointer; min-width: 160px; }
   .toolbar select:focus { outline: none; border-color: var(--accent); }
   .toolbar select:disabled { opacity: .4; cursor: not-allowed; }
+  .content-language { gap: 6px; }
+  .content-language select { min-width: 112px; }
+  .language-status { color: var(--text-muted); font-size: 10px; white-space: nowrap; }
+  .language-translate { background: var(--accent-soft); border: 1px solid var(--accent);
+    color: var(--accent); padding: 5px 8px; border-radius: var(--radius-sm);
+    cursor: pointer; font-size: 11px; white-space: nowrap; }
+  .language-translate[hidden] { display: none; }
   .toolbar .agent-status { font-size: 10px; padding: 2px 8px; border-radius: var(--radius-pill);
     font-family: var(--font-mono); }
   .toolbar .agent-status.connected { background: var(--green-bg); color: var(--green); }
@@ -1065,6 +1072,18 @@
         <span class="label" id="agent-pill-label">—</span><span class="arrow">▾</span>
       </button>
       <div class="agent-menu" id="agent-menu" hidden></div>
+    </div>
+
+    <div class="toolbar-section content-language">
+      <span class="sec-label" data-i18n="toolbar.content_language">Video language</span>
+      <select id="content-language-select" disabled>
+        <option value="auto" data-i18n="content_language.auto">Auto</option>
+        <option value="vi">Tiếng Việt</option>
+        <option value="en">English</option>
+        <option value="zh-CN">简体中文</option>
+      </select>
+      <span class="language-status" id="content-language-status"></span>
+      <button class="language-translate" id="btn-translate-video" hidden></button>
     </div>
 
     <!-- Model picker — only shown for agents that expose a model catalog (AMR). -->

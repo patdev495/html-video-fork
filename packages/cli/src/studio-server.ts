@@ -11,7 +11,14 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import type { CliContext } from './context.js';
-import { AssetStore, generateTts, generateMusic } from '@html-video/core';
+import {
+  AssetStore,
+  contentLanguageInstruction,
+  generateTts,
+  generateMusic,
+  type ContentLanguageChoice,
+  type ResolvedContentLanguage,
+} from '@html-video/core';
 import { extractUrls, fetchSource } from './fetch-source.js';
 import { detectAll, findAgent, spawnAgent } from '@html-video/runtime';
 
@@ -206,6 +213,35 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           body.agent_model === undefined ? undefined : ((body.agent_model as string) || null),
         );
         return json(res, 200, { project });
+      }
+
+      // Set the video-content language. This is independent from the Studio UI
+      // locale and only changes the target; existing generated artifacts remain
+      // in `contentLanguage` until generation/translation succeeds.
+      const languageMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/content-language$/);
+      if (languageMatch && languageMatch[1] && m === 'PUT') {
+        const body = await readBody(req);
+        const choice = body.language as ContentLanguageChoice;
+        if (!['auto', 'vi', 'en', 'zh-CN'].includes(choice)) {
+          return json(res, 400, { error: 'language must be auto, vi, en, or zh-CN' });
+        }
+        const project = await ctx.orchestrator.load(languageMatch[1]);
+        const sources: Array<{ text: string }> = [];
+        for (const asset of project.assets) {
+          if (asset.type !== 'text' && asset.type !== 'data') continue;
+          if (asset.content) {
+            sources.push({ text: asset.content });
+          } else if (asset.path && existsSync(asset.path)) {
+            sources.push({ text: await readFile(asset.path, 'utf8') });
+          }
+        }
+        const history = await loadMessages(ctx, project.id);
+        const updated = await ctx.orchestrator.setContentLanguage(project.id, {
+          choice,
+          sources,
+          openingRequest: resolveOpeningTopic(project, history),
+        });
+        return json(res, 200, { project: updated });
       }
 
       // Set variables (whole bag)
@@ -817,7 +853,7 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
         }
 
         // Re-fetch project after potential addFileAsset side-effects
-        const project = await ctx.orchestrator.load(id);
+        let project = await ctx.orchestrator.load(id);
         const tmpl = project.templateId ? ctx.templates.get(project.templateId) : null;
         // No template required — agent can synthesize from scratch when none picked.
 
@@ -899,6 +935,16 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           }
         }
 
+        // Resolve old/default projects and automatic source detection before
+        // prompt construction. Asset order is stable, so the first source wins.
+        project = await ctx.orchestrator.setContentLanguage(id, {
+          choice: project.preferences.language ?? 'auto',
+          sources: attachments
+            .filter((a) => !!a.inlineText)
+            .map((a) => ({ text: a.inlineText! })),
+          openingRequest: resolveOpeningTopic(project, history),
+        });
+
         const fullPrompt = buildHtmlGenerationPrompt({
           tmpl,
           exampleHtml,
@@ -908,6 +954,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
           attachments,
           focusFrameId: focusFrameId || undefined,
           openingTopic: resolveOpeningTopic(project, history),
+          targetLanguage: project.preferences.targetLanguage!,
+          currentLanguage: project.preferences.contentLanguage,
         });
         const phaseInfo = detectPhase(
           history,
@@ -1028,6 +1076,8 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               inputs: rewriteInputs ?? phaseInfo.inputs,
               attachments,
               openingTopic: resolveOpeningTopic(project, history),
+              targetLanguage: project.preferences.targetLanguage!,
+              currentLanguage: project.preferences.contentLanguage,
               restyleOnly,
               onProgress: (msg) => {
                 assistantText += msg + '\n';
@@ -1036,6 +1086,9 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
               },
               onSse: sseWrite,
             });
+            if (!restyleOnly) {
+              await ctx.orchestrator.markContentLanguageGenerated(id);
+            }
             summaryLine = rewriteInputs
               ? `✓ ${result.frameCount}-frame storyboard ${restyleOnly ? 'restyled' : 'regenerated'} (intent: ${result.intent})`
               : `✓ ${result.frameCount}-frame storyboard generated (intent: ${result.intent})`;
@@ -1147,12 +1200,18 @@ export async function startStudioServer(ctx: CliContext, port: number): Promise<
                   sseWrite({ type: 'text', chunk: `\n[frame ${f.nodeId} skipped: ${msg}]\n` });
                 }
               }
+              if (phaseInfo.phase === 'generate' || phaseInfo.phase === 'iterate-content') {
+                await ctx.orchestrator.markContentLanguageGenerated(id);
+              }
               sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}`, frames: multi.frames.length });
               summaryLine = `✓ ${multi.frames.length}-frame storyboard generated (intent: ${multi.graph.intent})`;
             } else {
               const extracted = extractHtmlDocument(assistantText);
               if (extracted) {
                 await ctx.orchestrator.writePreviewHtmlRaw(id, extracted);
+                if (phaseInfo.phase === 'generate' || phaseInfo.phase === 'iterate-content') {
+                  await ctx.orchestrator.markContentLanguageGenerated(id);
+                }
                 sseWrite({ type: 'preview_ready', preview_url: `/preview/${id}` });
                 summaryLine = '✓ updated the HTML preview';
               }
@@ -1749,6 +1808,8 @@ interface BuildPromptArgs {
   focusFrameId?: string;
   /** The user's original opening subject, locked across phases. */
   openingTopic?: string;
+  targetLanguage: ResolvedContentLanguage;
+  currentLanguage?: ResolvedContentLanguage;
 }
 
 interface Attachment {
@@ -2405,7 +2466,17 @@ function isMultiFrameType(pickedType: string): boolean {
 }
 
 function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
-  const { tmpl, exampleHtml, priorHtml, history, userText, attachments, openingTopic } = args;
+  const {
+    tmpl,
+    exampleHtml,
+    priorHtml,
+    history,
+    userText,
+    attachments,
+    openingTopic,
+    targetLanguage,
+    currentLanguage,
+  } = args;
 
   // When a template is selected, its own source HTML is the style ground truth —
   // NOT a prior render. Otherwise a project that was previously rendered in some
@@ -2421,6 +2492,10 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
   // about. The source rides into every phase's prompt via `attachments`.
   const hasSourceMaterial = attachments.some((a) => !!a.inlineText);
   const { phase, inputs } = detectPhase(history, userText, !!tmpl, hasSourceMaterial, args.focusFrameId ?? '');
+  const promptLanguage =
+    phase === 'generate' || phase === 'iterate-content'
+      ? targetLanguage
+      : (currentLanguage ?? targetLanguage);
 
   // ---- edit-menu: post-generation "what do you want to change?" card ----
   if (phase === 'edit-menu') {
@@ -2744,6 +2819,7 @@ function buildHtmlGenerationPrompt(args: BuildPromptArgs): string {
 
     const p: string[] = [];
     p.push(`Generate the HTML video file(s) the user just confirmed.`);
+    p.push(contentLanguageInstruction(promptLanguage));
     p.push('');
     // Lock the subject to the user's opening request. The content turns below
     // can be as thin as "随机" — without this the video drifts onto that literal
@@ -3070,6 +3146,8 @@ interface SplitGenerateArgs {
   attachments: Attachment[];
   /** The user's original opening subject, locked across phases. */
   openingTopic?: string;
+  targetLanguage: ResolvedContentLanguage;
+  currentLanguage?: ResolvedContentLanguage;
   /**
    * Restyle mode: keep the EXISTING content-graph text verbatim and only
    * re-render each frame's HTML in the new style. Skips the Step-1 graph
@@ -3091,7 +3169,26 @@ interface SplitGenerateArgs {
 async function runSplitMultiFrameGenerate(
   args: SplitGenerateArgs,
 ): Promise<{ frameCount: number; intent: string }> {
-  const { ctx, projectId, projectDir, agentDef, agentModel, tmpl, priorHtml, inputs, attachments, openingTopic, restyleOnly, onProgress, onSse } = args;
+  const {
+    ctx,
+    projectId,
+    projectDir,
+    agentDef,
+    agentModel,
+    tmpl,
+    priorHtml,
+    inputs,
+    attachments,
+    openingTopic,
+    targetLanguage,
+    currentLanguage,
+    restyleOnly,
+    onProgress,
+    onSse,
+  } = args;
+  const promptLanguage = restyleOnly
+    ? (currentLanguage ?? targetLanguage)
+    : targetLanguage;
   const collected = inputs.collected ?? {};
   const pickedType = inputs.pickedType ?? '';
   const pickedStyle = inputs.pickedStyle ?? '';
@@ -3160,6 +3257,7 @@ async function runSplitMultiFrameGenerate(
   } else {
   onProgress(`📋 规划 ${frameCountReq} 帧的故事板…`);
   const graphPromptParts: string[] = [];
+  graphPromptParts.push(contentLanguageInstruction(promptLanguage));
   graphPromptParts.push(`Plan a ${frameCountReq}-frame HTML video storyboard. Output ONLY a content-graph JSON in a fenced \`\`\`json#content-graph block — no HTML, no prose outside.`);
   graphPromptParts.push('');
   graphPromptParts.push(`Inputs (use literally — do NOT invent brand names or facts beyond these):`);
@@ -3268,6 +3366,7 @@ async function runSplitMultiFrameGenerate(
 
     const frameContext = describeNode(node);
     const fp: string[] = [];
+    fp.push(contentLanguageInstruction(promptLanguage));
     fp.push(`Generate ONE complete HTML page for frame "${nodeId}" of a ${graph.nodes.length}-frame video. Output ONE \`\`\`html block, nothing else.`);
     fp.push('');
     fp.push(`Frame ${i + 1} of ${graph.nodes.length}: ${frameContext}`);

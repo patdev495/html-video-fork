@@ -27,6 +27,11 @@ import {
 import { HtmlVideoError } from './errors.js';
 import type { AssetStore } from './asset-store.js';
 import type { EngineRegistry, ProjectStore, TemplateRegistry } from './registry.js';
+import {
+  resolveContentLanguage,
+  type ContentLanguageChoice,
+  type ContentLanguageSource,
+} from './content-language.js';
 
 export interface CreateProjectInput {
   name: string;
@@ -41,6 +46,23 @@ export interface ProjectOrchestratorDeps {
   projects: ProjectStore;
   assets: AssetStore;
 }
+
+export interface SetContentLanguageInput {
+  choice: ContentLanguageChoice;
+  sources?: ContentLanguageSource[];
+  openingRequest?: string;
+}
+
+export type ReplaceGeneratedContentInput =
+  | {
+      graph: ContentGraph;
+      frames: Record<string, string>;
+      contentLanguage: Project['preferences']['contentLanguage'];
+    }
+  | {
+      html: string;
+      contentLanguage: Project['preferences']['contentLanguage'];
+    };
 
 export class ProjectOrchestrator {
   constructor(private readonly deps: ProjectOrchestratorDeps) {}
@@ -177,6 +199,41 @@ export class ProjectOrchestrator {
     // stale model unless a new one is given.
     if (agentModel !== undefined) project.agentModel = agentModel;
     else project.agentModel = null;
+    await this.deps.projects.save(project);
+    return project;
+  }
+
+  async setContentLanguage(
+    projectId: string,
+    input: SetContentLanguageInput,
+  ): Promise<Project> {
+    const project = await this.deps.projects.load(projectId);
+    const resolution = resolveContentLanguage({
+      ...input,
+      currentLanguage: project.preferences.contentLanguage,
+    });
+    project.preferences = {
+      ...project.preferences,
+      language: resolution.choice,
+      targetLanguage: resolution.targetLanguage,
+    };
+    await this.deps.projects.save(project);
+    return project;
+  }
+
+  async markContentLanguageGenerated(projectId: string): Promise<Project> {
+    const project = await this.deps.projects.load(projectId);
+    const target = project.preferences.targetLanguage;
+    if (!target) {
+      throw new HtmlVideoError(
+        'invalid-input',
+        'Cannot commit content language before a target language is resolved',
+      );
+    }
+    project.preferences = {
+      ...project.preferences,
+      contentLanguage: target,
+    };
     await this.deps.projects.save(project);
     return project;
   }
@@ -321,6 +378,135 @@ export class ProjectOrchestrator {
     if (project.status === 'draft') project.status = 'previewed';
     await this.deps.projects.save(project);
     return { project, frame };
+  }
+
+  /**
+   * Replace translated artifacts as one logical transaction. All candidate
+   * files are validated and staged before any current artifact is touched.
+   */
+  async replaceGeneratedContentAtomic(
+    projectId: string,
+    input: ReplaceGeneratedContentInput,
+  ): Promise<Project> {
+    if (!input.contentLanguage) {
+      throw new HtmlVideoError('invalid-input', 'Translated content language is required');
+    }
+
+    const project = await this.deps.projects.load(projectId);
+    const projectDir = await this.deps.projects.ensureDir(projectId);
+    const { mkdir, readFile, rename, rm, writeFile } = await import('node:fs/promises');
+    const { existsSync } = await import('node:fs');
+    const transactionId = randomUUID().slice(0, 12);
+    const stagedPaths: Array<{ staged: string; target: string }> = [];
+    const previous = new Map<string, Buffer | null>();
+    let nextProject: Project;
+
+    if ('graph' in input) {
+      const validation = validateGraph(input.graph);
+      if (!validation.ok) {
+        throw new HtmlVideoError(
+          'invalid-input',
+          `ContentGraph invalid: ${validation.errors.map((e) => e.message).join('; ')}`,
+        );
+      }
+      const order = topoSort(input.graph);
+      const frameIds = Object.keys(input.frames).sort();
+      const expectedIds = [...order].sort();
+      if (
+        frameIds.length !== expectedIds.length ||
+        frameIds.some((id, index) => id !== expectedIds[index])
+      ) {
+        throw new HtmlVideoError(
+          'invalid-input',
+          'Atomic multi-frame replacement requires exactly one HTML document for every graph node',
+        );
+      }
+      for (const id of order) {
+        if (!/<\/html>/i.test(input.frames[id] ?? '')) {
+          throw new HtmlVideoError('invalid-input', `Frame "${id}" must be a complete HTML document`);
+        }
+      }
+
+      const framesDir = join(projectDir, 'frames');
+      await mkdir(framesDir, { recursive: true });
+      const graphPath = join(projectDir, 'content-graph.json');
+      const stagedGraphPath = `${graphPath}.staged-${transactionId}`;
+      await writeFile(stagedGraphPath, JSON.stringify(input.graph, null, 2), 'utf8');
+      stagedPaths.push({ staged: stagedGraphPath, target: graphPath });
+
+      const frames: FrameRecord[] = [];
+      for (let index = 0; index < order.length; index += 1) {
+        const nodeId = order[index]!;
+        const node = input.graph.nodes.find((candidate) => candidate.id === nodeId)!;
+        const safeId = nodeId.replace(/[^a-z0-9_-]/gi, '_');
+        const htmlPath = join(
+          framesDir,
+          `${String(index + 1).padStart(2, '0')}-${safeId}.html`,
+        );
+        const stagedHtmlPath = `${htmlPath}.staged-${transactionId}`;
+        await writeFile(stagedHtmlPath, input.frames[nodeId]!, 'utf8');
+        stagedPaths.push({ staged: stagedHtmlPath, target: htmlPath });
+        frames.push({
+          graphNodeId: nodeId,
+          htmlPath,
+          durationSec: node.durationSec ?? DEFAULT_FRAME_DURATION_SEC,
+          order: index,
+        });
+      }
+
+      nextProject = {
+        ...project,
+        contentGraphPath: graphPath,
+        frames,
+        lastPreviewHtmlPath: frames[0]?.htmlPath,
+        preferences: {
+          ...project.preferences,
+          contentLanguage: input.contentLanguage,
+        },
+        status: project.status === 'rendered' ? 'rendered' : 'previewed',
+      };
+    } else {
+      if (!/<\/html>/i.test(input.html)) {
+        throw new HtmlVideoError('invalid-input', 'Single-frame replacement must be a complete HTML document');
+      }
+      const htmlPath = join(projectDir, 'preview.html');
+      const stagedHtmlPath = `${htmlPath}.staged-${transactionId}`;
+      await writeFile(stagedHtmlPath, input.html, 'utf8');
+      stagedPaths.push({ staged: stagedHtmlPath, target: htmlPath });
+      nextProject = {
+        ...project,
+        lastPreviewHtmlPath: htmlPath,
+        frames: [],
+        preferences: {
+          ...project.preferences,
+          contentLanguage: input.contentLanguage,
+        },
+        status: project.status === 'rendered' ? 'rendered' : 'previewed',
+      };
+      delete nextProject.contentGraphPath;
+    }
+
+    try {
+      for (const { staged, target } of stagedPaths) {
+        previous.set(target, existsSync(target) ? await readFile(target) : null);
+        await rename(staged, target);
+      }
+      await this.deps.projects.save(nextProject);
+      return nextProject;
+    } catch (error) {
+      for (const { target } of stagedPaths) {
+        const old = previous.get(target);
+        if (old === undefined) continue;
+        if (old === null) await rm(target, { force: true });
+        else await writeFile(target, old);
+      }
+      await this.deps.projects.save(project);
+      throw error;
+    } finally {
+      for (const { staged } of stagedPaths) {
+        await rm(staged, { force: true });
+      }
+    }
   }
 
   // ---------------- Render: preview HTML / export MP4 ----------------

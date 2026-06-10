@@ -53,6 +53,9 @@ out/
 # Local-only working files
 scratch/
 tmp/
+.codegraph/
+*.staged-*
+*.backup-*
 
 # Per-user runtime state (projects, assets, preview, MP4 outputs)
 # This dir is created by the CLI / studio at runtime and is per-developer.

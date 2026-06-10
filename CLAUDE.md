@@ -3,6 +3,29 @@
 > Open-source HTML→Video meta-layer。让本地 coding agent 跨多个渲染 engine（Hyperframes / Remotion / Motion Canvas / Revideo）一站式做 HTML 视频。
 > 启动时间：2026-05-26（继 OD / HA / OD-pitch / OD-landing 之后的下一代 nexu-io 开源产品）
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are stored as local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`, and `done`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context domain documentation layout. Read
+`docs/architecture.md` before changing implementation, then see
+`docs/agents/domain.md`.
+
+## Development environment
+
+- This project targets Linux.
+- Run build, development, test, render, and other Linux-dependent commands inside WSL.
+- Do not run project commands directly from Windows PowerShell unless the command is explicitly Windows-specific.
+- When an agent invokes commands from Windows, use WSL and execute them from the repository's WSL-mounted path.
+
 ## 角色与边界
 
 - **角色**：T9（端口段 **3071-3079**）—— 现有 T1-T8 已分配

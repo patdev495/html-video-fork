@@ -12,6 +12,8 @@ export { ProjectOrchestrator } from './project.js';
 export type {
   CreateProjectInput,
   ProjectOrchestratorDeps,
+  ReplaceGeneratedContentInput,
+  SetContentLanguageInput,
 } from './project.js';
 export {
   resolveMinimaxCredentials,
@@ -19,3 +21,15 @@ export {
   generateMusic,
 } from './minimax.js';
 export type { MinimaxCredentials, MinimaxAudioResult } from './minimax.js';
+export {
+  contentLanguageInstruction,
+  detectContentLanguage,
+  resolveContentLanguage,
+} from './content-language.js';
+export type {
+  ContentLanguageChoice,
+  ResolvedContentLanguage,
+  ContentLanguageSource,
+  ResolveContentLanguageInput,
+  ContentLanguageResolution,
+} from './content-language.js';

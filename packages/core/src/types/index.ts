@@ -7,6 +7,11 @@
  * after Joey's product clarification — see RFC-05.
  */
 
+import type {
+  ContentLanguageChoice,
+  ResolvedContentLanguage,
+} from '../content-language.js';
+
 // ============================================================================
 // RFC-01: Engine Adapter
 // ============================================================================
@@ -320,7 +325,12 @@ export interface UserPreferences {
   mood?: string;
   brandColors?: string[];
   fontFamilies?: string[];
-  language?: string;
+  /** User-selected generation policy. Independent from the Studio UI locale. */
+  language?: ContentLanguageChoice;
+  /** Concrete language resolved from `language` and the available source. */
+  targetLanguage?: ResolvedContentLanguage;
+  /** Language of the currently generated video artifacts. */
+  contentLanguage?: ResolvedContentLanguage;
   commercial?: boolean;
 }
 
